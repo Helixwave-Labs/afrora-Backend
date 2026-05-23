@@ -1,5 +1,6 @@
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, Query
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, Query, Request
 from typing import List, Optional
+from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
 import shutil
 import os
@@ -8,6 +9,14 @@ from datetime import datetime
 
 from app import models, schemas, auth
 from app.database import get_db
+from app.s3_utils import upload_file_to_s3, delete_file_from_s3
+from app.cache_utils import get_cached_data, set_cached_data, delete_cache_pattern
+
+async def invalidate_product_cache(request: Request, product_id: Optional[int] = None):
+    """Utility to invalidate product cache on writes."""
+    await delete_cache_pattern(request, "products:list:*")
+    if product_id:
+        await delete_cache_pattern(request, f"product:id_{product_id}")
 
 router = APIRouter(
     prefix="/products",
@@ -22,10 +31,15 @@ PRODUCT_IMAGES_URL_PREFIX = "/static/product_images"
 os.makedirs(PRODUCT_IMAGES_DIR, exist_ok=True)
 
 def save_image(file: UploadFile, owner_id: int) -> str:
-    """Saves an uploaded image and returns its URL path."""
+    """Saves an uploaded image to AWS S3 (if configured) or locally, and returns its URL."""
+    bucket_name = os.getenv("AWS_STORAGE_BUCKET_NAME")
+    if bucket_name:
+        return upload_file_to_s3(file, folder="product_images")
+
+    # Local fallback
     if not file.filename:
         raise HTTPException(status_code=400, detail="Filename is required")
-    filename = file.filename  # Now it's str
+    filename = file.filename
     file_extension = Path(filename).suffix
     unique_filename = f"{owner_id}_{int(datetime.utcnow().timestamp())}{file_extension}"
     file_path = PRODUCT_IMAGES_DIR / unique_filename
@@ -39,9 +53,15 @@ def save_image(file: UploadFile, owner_id: int) -> str:
     return f"{PRODUCT_IMAGES_URL_PREFIX}/{unique_filename}"
 
 def delete_image(image_url: Optional[str]):
-    """Deletes an image file from the server if it exists."""
+    """Deletes an image file from AWS S3 or the local server if it exists."""
     if not image_url:
         return
+    
+    bucket_name = os.getenv("AWS_STORAGE_BUCKET_NAME")
+    if bucket_name:
+        delete_file_from_s3(image_url)
+        return
+
     try:
         # Construct local path from URL: "/static/product_images/file.jpg" -> "static/product_images/file.jpg"
         local_path = Path(image_url.lstrip('/'))
@@ -52,7 +72,8 @@ def delete_image(image_url: Optional[str]):
         pass
 
 @router.post("/", status_code=status.HTTP_201_CREATED, response_model=schemas.ProductOut)
-def create_product(
+async def create_product(
+    request: Request,
     name: str = Form(...),
     description: str = Form(...),
     price: float = Form(...),
@@ -87,10 +108,15 @@ def create_product(
     db.add(new_product)
     db.commit()
     db.refresh(new_product)
+
+    # Invalidate Cache
+    await invalidate_product_cache(request)
+
     return new_product
 
 @router.get("/", response_model=List[schemas.ProductOut])
-def get_all_products(
+async def get_all_products(
+    request: Request,
     db: Session = Depends(get_db),
     category_id: Optional[int] = Query(None, description="Filter by parent category ID"),
     subcategory_id: Optional[int] = Query(None, description="Filter by subcategory ID"),
@@ -102,6 +128,12 @@ def get_all_products(
     Retrieve a list of all products. Publicly accessible.
     Supports pagination, searching, and filtering by category/subcategory.
     """
+    # Try serving from Redis cache
+    cache_key = f"products:list:cat_{category_id}:sub_{subcategory_id}:q_{search}:skip_{skip}:lim_{limit}"
+    cached_products = await get_cached_data(request, cache_key)
+    if cached_products is not None:
+        return cached_products
+
     products_query = db.query(models.Product).options(
         joinedload(models.Product.owner),
         joinedload(models.Product.subcategory)
@@ -115,20 +147,36 @@ def get_all_products(
         products_query = products_query.filter(models.Product.subcategory_id == subcategory_id)
 
     if search:
-        search_term = f"%{search}%"
-        products_query = products_query.filter(
-            # Or operator using |
-            (models.Product.name.ilike(search_term)) | (models.Product.description.ilike(search_term))
-        )
+        # Optimize with PostgreSQL Full-Text Search if database is postgresql
+        if db.bind and "postgresql" in str(db.bind.url):
+            ts_vector = func.to_tsvector('english', models.Product.name + ' ' + models.Product.description)
+            ts_query = func.plainto_tsquery('english', search)
+            products_query = products_query.filter(ts_vector.op('@@')(ts_query))
+        else:
+            search_term = f"%{search}%"
+            products_query = products_query.filter(
+                (models.Product.name.ilike(search_term)) | (models.Product.description.ilike(search_term))
+            )
 
     products = products_query.offset(skip).limit(limit).all()
+
+    # Serialize results to serialize safely for Redis
+    serialized_products = [schemas.ProductOut.model_validate(p).model_dump(mode='json') for p in products]
+    await set_cached_data(request, cache_key, serialized_products, expire_seconds=300)
+
     return products
 
 @router.get("/{product_id}", response_model=schemas.ProductOut)
-def get_product(product_id: int, db: Session = Depends(get_db)):
+async def get_product(request: Request, product_id: int, db: Session = Depends(get_db)):
     """
     Retrieve a single product by its ID. Publicly accessible.
     """
+    # Try serving from Redis cache
+    cache_key = f"product:id_{product_id}"
+    cached_product = await get_cached_data(request, cache_key)
+    if cached_product is not None:
+        return cached_product
+
     # Use joinedload to eagerly load related owner and subcategory in a single query
     product = db.query(models.Product).options(
         joinedload(models.Product.owner), # Eagerly load the product's owner
@@ -146,12 +194,17 @@ def get_product(product_id: int, db: Session = Depends(get_db)):
     else:
         average_rating = None
 
-    # Manually construct the response to include calculated fields
-    return schemas.ProductOut(**product.__dict__, average_rating=average_rating, review_count=review_count)
+    response_data = schemas.ProductOut(**product.__dict__, average_rating=average_rating, review_count=review_count)
+    
+    # Store response in Redis cache (expire in 10 minutes)
+    await set_cached_data(request, cache_key, response_data.model_dump(mode='json'), expire_seconds=600)
+
+    return response_data
 
 @router.put("/{product_id}", response_model=schemas.ProductOut)
-def update_product(
+async def update_product(
     product_id: int,
+    request: Request,
     name: Optional[str] = Form(None),
     description: Optional[str] = Form(None),
     price: Optional[float] = Form(None),
@@ -199,11 +252,16 @@ def update_product(
 
     db.commit()
     db.refresh(product)
+
+    # Invalidate Cache
+    await invalidate_product_cache(request, product_id)
+
     return product
 
 @router.delete("/{product_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_product(
+async def delete_product(
     product_id: int,
+    request: Request,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_user)
 ):
@@ -223,5 +281,8 @@ def delete_product(
 
     db.delete(product)
     db.commit()
+
+    # Invalidate Cache
+    await invalidate_product_cache(request, product_id)
 
     return

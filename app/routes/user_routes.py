@@ -8,6 +8,7 @@ from pathlib import Path
 
 from app import models, schemas, auth
 from app.database import get_db
+from app.s3_utils import upload_file_to_s3, delete_file_from_s3
 from app.email_utils import generate_otp, send_verification_email, send_password_reset_email
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi_limiter.depends import RateLimiter
@@ -25,7 +26,12 @@ PROFILE_PICS_URL_PREFIX = "/static/profile_pics"
 os.makedirs(PROFILE_PICS_DIR, exist_ok=True)
 
 @router.post("/", status_code=status.HTTP_201_CREATED, response_model=schemas.UserOut)
-async def create_user(user: schemas.UserCreate, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+async def create_user(
+    user: schemas.UserCreate,
+    background_tasks: BackgroundTasks,
+    request: Request,
+    db: Session = Depends(get_db)
+):
     # Check if user with that email or username already exists
     existing_user = db.query(models.User).filter(
         (models.User.email == user.email) | (models.User.username == user.username)
@@ -56,8 +62,12 @@ async def create_user(user: schemas.UserCreate, background_tasks: BackgroundTask
     db.commit()
     db.refresh(new_user)
 
-    # Send verification email in the background
-    background_tasks.add_task(send_verification_email, new_user.email, otp)
+    # Send verification email using ARQ queue (or fallback to BackgroundTasks)
+    arq_pool = request.app.state.arq_pool if hasattr(request, "app") and hasattr(request.app.state, "arq_pool") else None
+    if arq_pool:
+        await arq_pool.enqueue_job("send_verification_email_task", new_user.email, otp)
+    else:
+        background_tasks.add_task(send_verification_email, new_user.email, otp)
 
     return new_user
 
@@ -112,14 +122,15 @@ def verify_email(verification_data: schemas.EmailVerification, db: Session = Dep
     dependencies=[Depends(RateLimiter(times=1, minutes=1))]
 )
 async def resend_otp(
-    request: schemas.ResendOTPRequest,
+    payload: schemas.ResendOTPRequest,
     background_tasks: BackgroundTasks,
+    request: Request,
     db: Session = Depends(get_db)
 ):
     """
     Resends the One-Time Password (OTP) to a user's email if their account is not yet verified.
     """
-    user = db.query(models.User).filter(models.User.email == request.email).first()
+    user = db.query(models.User).filter(models.User.email == payload.email).first()
 
     if not user:
         # Note: Returning a 404 can allow for email enumeration. In a production
@@ -136,18 +147,23 @@ async def resend_otp(
     user.otp_expires_at = datetime.utcnow() + timedelta(minutes=10)  # type: ignore
     db.commit()
 
-    # Send the new OTP email in the background
-    background_tasks.add_task(send_verification_email, user.email, new_otp)
+    # Send the new OTP email using ARQ queue (or fallback to BackgroundTasks)
+    arq_pool = request.app.state.arq_pool if hasattr(request, "app") and hasattr(request.app.state, "arq_pool") else None
+    if arq_pool:
+        await arq_pool.enqueue_job("send_verification_email_task", user.email, new_otp)
+    else:
+        background_tasks.add_task(send_verification_email, user.email, new_otp)
 
     return {"message": "A new verification OTP has been sent to your email."}
 
 @router.post("/forgot-password", status_code=status.HTTP_200_OK, dependencies=[Depends(RateLimiter(times=1, minutes=1))])
 async def forgot_password(
-    request: schemas.ForgotPasswordRequest,
+    payload: schemas.ForgotPasswordRequest,
     background_tasks: BackgroundTasks,
+    request: Request,
     db: Session = Depends(get_db)
 ):
-    user = db.query(models.User).filter(models.User.email == request.email).first()
+    user = db.query(models.User).filter(models.User.email == payload.email).first()
 
     # To prevent email enumeration, always return a success message,
     # but only perform actions if the user exists.
@@ -158,8 +174,12 @@ async def forgot_password(
         user.password_reset_token_expires_at = datetime.utcnow() + timedelta(minutes=15)  # type: ignore
         db.commit()
 
-        # Send the email in the background
-        background_tasks.add_task(send_password_reset_email, user.email, token)
+        # Send the email using ARQ queue (or fallback to BackgroundTasks)
+        arq_pool = request.app.state.arq_pool if hasattr(request, "app") and hasattr(request.app.state, "arq_pool") else None
+        if arq_pool:
+            await arq_pool.enqueue_job("send_password_reset_email_task", user.email, token)
+        else:
+            background_tasks.add_task(send_password_reset_email, user.email, token)
 
     return {"message": "If an account with that email exists, a password reset link has been sent."}
 
@@ -230,10 +250,11 @@ def read_users_me(current_user: models.User = Depends(auth.get_current_user)):
 def upload_profile_picture(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
-    current_user: models.User = Depends(auth.get_current_user) # Assumes you have this dependency
+    current_user: models.User = Depends(auth.get_current_user)
 ):
     """
     Upload or update the current user's profile picture.
+    Uses AWS S3 if configured, falling back to local storage if not.
     """
     # 1. Validate file type
     if not file.content_type or not file.content_type.startswith("image/"):
@@ -242,40 +263,41 @@ def upload_profile_picture(
             detail="Invalid file type. Please upload an image."
         )
 
-    # 2. Generate a unique filename to prevent conflicts
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="Filename is required")
-    file_extension = Path(file.filename).suffix
-    # Using user ID and a timestamp for a unique, identifiable name
-    unique_filename = f"{current_user.id}_{int(datetime.utcnow().timestamp())}{file_extension}"
-    file_path = PROFILE_PICS_DIR / unique_filename
+    # 2. Check if S3 is configured
+    bucket_name = os.getenv("AWS_STORAGE_BUCKET_NAME")
+    if bucket_name:
+        # Delete the old S3 profile picture if it exists
+        if current_user.profile_picture_url:
+            delete_file_from_s3(current_user.profile_picture_url)
+        # Upload new file to S3
+        file_url = upload_file_to_s3(file, folder="profile_pics")
+    else:
+        # Fallback to local storage
+        if not file.filename:
+            raise HTTPException(status_code=400, detail="Filename is required")
+        file_extension = Path(file.filename).suffix
+        unique_filename = f"{current_user.id}_{int(datetime.utcnow().timestamp())}{file_extension}"
+        file_path = PROFILE_PICS_DIR / unique_filename
 
-    # 3. Save the file to the server
-    try:
-        with file_path.open("wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-    finally:
-        file.file.close()
+        try:
+            with file_path.open("wb") as buffer:
+                shutil.copyfileobj(file.file, buffer)
+        finally:
+            file.file.close()
 
-    # 4. Delete the old profile picture if it exists
-    old_picture_url = current_user.profile_picture_url
-    if old_picture_url:
-        # Construct the local filesystem path from the URL
-        # e.g., from "/static/profile_pics/image.png" to "static/profile_pics/image.png"
-        old_picture_path = Path(old_picture_url.lstrip('/'))
+        # Delete the old local file if it exists
+        if current_user.profile_picture_url:
+            old_picture_path = Path(current_user.profile_picture_url.lstrip('/'))
+            if old_picture_path.exists() and old_picture_path.is_file():
+                try:
+                    os.remove(old_picture_path)
+                except OSError:
+                    pass
 
-        # Check if the file exists and delete it
-        if old_picture_path.exists() and old_picture_path.is_file():
-            try:
-                os.remove(old_picture_path)
-            except OSError:
-                # Log this error in a real application
-                pass
+        file_url = f"{PROFILE_PICS_URL_PREFIX}/{unique_filename}"
 
-    # 4. Update the user's record in the database
-    # We store the URL path, not the local filesystem path
-    file_url = f"{PROFILE_PICS_URL_PREFIX}/{unique_filename}"
+    # 3. Update the user's record in the database
     current_user.profile_picture_url = file_url
     db.commit()
 
-    return {"message": "Profile picture updated successfully.", "profile_picture_url": file_url}
+    return {"message": "Profile picture updated successfully.", "profile_picture_url": file_url}
