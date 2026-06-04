@@ -13,4 +13,4 @@ alembic upgrade head
 echo "Starting server..."
 # The 'exec' command is important, it replaces the shell process with the uvicorn process,
 # allowing it to receive signals correctly (like CTRL+C).
-exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+exec uvicorn app.interfaces.main:app --host 0.0.0.0 --port 8000 --reload

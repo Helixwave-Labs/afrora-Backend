@@ -1,7 +1,5 @@
-from app.database import engine
-from app.models import Base
-# Import models to ensure they are registered with Base metadata before creation
-import app.models
+from app.infrastructure.database.database import write_engine as engine, Base
+import app.infrastructure.models.models
 
 def init():
     Base.metadata.create_all(bind=engine)

@@ -1,5 +1,5 @@
 .venv\Scripts\Activate.ps1
-uvicorn app.main:app --reload
+uvicorn app.interfaces.main:app --reload
 
 
 docker build -t afro_vouge-v1:latest .

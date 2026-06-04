@@ -38,7 +38,7 @@ services:
       - ./.env
     # Replacing script with direct command to avoid Windows CRLF issues
     # Simplify: Start server immediately to stop crash loop, then we will run init_db manually
-    entrypoint: ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port 8000"]
+    entrypoint: ["sh", "-c", "uvicorn app.interfaces.main:app --host 0.0.0.0 --port 8000"]
     depends_on:
       db:
         condition: service_healthy
