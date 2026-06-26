@@ -33,7 +33,7 @@ PRODUCT_IMAGES_URL_PREFIX = "/static/product_images"
 os.makedirs(PRODUCT_IMAGES_DIR, exist_ok=True)
 
 def save_image(file: UploadFile, owner_id: str) -> str:
-    bucket_name = os.getenv("AWS_STORAGE_BUCKET_NAME")
+    bucket_name = os.getenv("R2_BUCKET_NAME") or os.getenv("AWS_STORAGE_BUCKET_NAME")
     if bucket_name:
         return upload_file_to_s3(file, folder="product_images")
 
@@ -55,7 +55,7 @@ def save_image(file: UploadFile, owner_id: str) -> str:
 def delete_image(image_url: Optional[str]):
     if not image_url:
         return
-    bucket_name = os.getenv("AWS_STORAGE_BUCKET_NAME")
+    bucket_name = os.getenv("R2_BUCKET_NAME") or os.getenv("AWS_STORAGE_BUCKET_NAME")
     if bucket_name:
         delete_file_from_s3(image_url)
         return

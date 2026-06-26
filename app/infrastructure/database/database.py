@@ -5,14 +5,45 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+
 def make_async_url(url: str) -> str:
     """Helper to convert standard postgresql connection URL to async asyncpg URL."""
     if not url:
         return url
+    
+    scheme_replaced = False
     if url.startswith("postgresql://"):
-        return url.replace("postgresql://", "postgresql+asyncpg://", 1)
-    if url.startswith("postgres://"):
-        return url.replace("postgres://", "postgresql+asyncpg://", 1)
+        url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
+        scheme_replaced = True
+    elif url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql+asyncpg://", 1)
+        scheme_replaced = True
+        
+    parsed = urlparse(url)
+    if parsed.query:
+        query_params = parse_qs(parsed.query)
+        new_params = {}
+        for k, v in query_params.items():
+            if k == "sslmode":
+                # asyncpg uses 'ssl' instead of 'sslmode'
+                val = v[0]
+                if val in ("require", "verify-ca", "verify-full", "prefer"):
+                    new_params["ssl"] = val
+                elif val == "true":
+                    new_params["ssl"] = "require"
+                else:
+                    new_params["ssl"] = val
+            elif k == "channel_binding":
+                # asyncpg doesn't support channel_binding parameter
+                continue
+            else:
+                new_params[k] = v[0]
+        
+        new_query = urlencode(new_params)
+        parsed = parsed._replace(query=new_query)
+        url = urlunparse(parsed)
+        
     return url
 
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -21,8 +52,20 @@ DATABASE_READ_URL = os.getenv("DATABASE_READ_URL", DATABASE_URL)
 ASYNC_DATABASE_URL = make_async_url(DATABASE_URL)
 ASYNC_DATABASE_READ_URL = make_async_url(DATABASE_READ_URL)
 
-write_engine = create_async_engine(ASYNC_DATABASE_URL, pool_size=20, max_overflow=50)
-read_engine = create_async_engine(ASYNC_DATABASE_READ_URL, pool_size=20, max_overflow=50)
+write_engine = create_async_engine(
+    ASYNC_DATABASE_URL, 
+    pool_size=20, 
+    max_overflow=50,
+    pool_recycle=300,
+    pool_pre_ping=True
+)
+read_engine = create_async_engine(
+    ASYNC_DATABASE_READ_URL, 
+    pool_size=20, 
+    max_overflow=50,
+    pool_recycle=300,
+    pool_pre_ping=True
+)
 
 AsyncSessionLocalWrite = async_sessionmaker(bind=write_engine, class_=AsyncSession, expire_on_commit=False)
 AsyncSessionLocalRead = async_sessionmaker(bind=read_engine, class_=AsyncSession, expire_on_commit=False)

@@ -10,6 +10,12 @@ from arq.connections import RedisSettings # type: ignore
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi import HTTPException
+from fastapi.openapi.docs import (
+    get_redoc_html,
+    get_swagger_ui_html,
+    get_swagger_ui_oauth2_redirect_html,
+)
+
 
 from app.infrastructure.services.logging_service import setup_logging
 from app.interfaces.middlewares.envelope import (
@@ -47,7 +53,68 @@ if SENTRY_DSN and SENTRY_DSN.startswith("http"):
         profiles_sample_rate=1.0,
     )
 
-app = FastAPI(title="Afrovogue Commercial API", version="1.0")
+app = FastAPI(
+    title="Afrovogue Commercial API",
+    version="1.0",
+    docs_url=None,
+    redoc_url=None,
+)
+
+
+# Register global Bearer security scheme in OpenAPI schema for Swagger UI Authorize button
+from fastapi.openapi.utils import get_openapi
+
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    openapi_schema = get_openapi(
+        title="Afrovogue Commercial API",
+        version="1.0",
+        routes=app.routes,
+    )
+    # Define the Bearer Auth scheme
+    openapi_schema["components"] = openapi_schema.get("components", {})
+    openapi_schema["components"]["securitySchemes"] = {
+        "BearerAuth": {
+            "type": "http",
+            "scheme": "bearer",
+            "bearerFormat": "JWT",
+            "description": "Enter your access token here."
+        }
+    }
+    # Assign BearerAuth globally to all routes
+    for path in openapi_schema.get("paths", {}).values():
+        for method in path.values():
+            method["security"] = [{"BearerAuth": []}]
+            
+    app.openapi_schema = openapi_schema
+    return app.openapi_schema
+
+app.openapi = custom_openapi
+
+@app.get("/docs", include_in_schema=False)
+async def custom_swagger_ui_html():
+    return get_swagger_ui_html(
+        openapi_url=app.openapi_url,
+        title=app.title + " - Swagger UI",
+        oauth2_redirect_url="/docs/oauth2-redirect",
+        swagger_js_url="/static/docs/swagger-ui-bundle.js",
+        swagger_css_url="/static/docs/swagger-ui.css",
+        swagger_favicon_url="/static/docs/favicon.png",
+    )
+
+@app.get("/docs/oauth2-redirect", include_in_schema=False)
+async def swagger_ui_redirect():
+    return get_swagger_ui_oauth2_redirect_html()
+
+@app.get("/redoc", include_in_schema=False)
+async def redoc_html():
+    return get_redoc_html(
+        openapi_url=app.openapi_url,
+        title=app.title + " - ReDoc",
+        redoc_js_url="/static/docs/redoc.standalone.js",
+        redoc_favicon_url="/static/docs/favicon.png",
+    )
 
 # 3. Setup CORS Middleware
 origins = [
@@ -60,16 +127,19 @@ if not origins:
         "http://localhost:8000",
     ]
 
+# 4. Add custom envelope middleware (inner layer)
+app.add_middleware(EnvelopeMiddleware)
+
+# Register CORSMiddleware last (outermost layer) so it handles all outgoing responses and exceptions
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1|192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[0-1])\.\d+\.\d+)(:\d+)?",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# 4. Add custom envelope middleware
-app.add_middleware(EnvelopeMiddleware)
 
 # 5. Add validation and exception handlers
 app.add_exception_handler(HTTPException, http_exception_handler)

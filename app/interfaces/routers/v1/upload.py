@@ -20,11 +20,11 @@ def get_presigned_upload_url(
     payload: PresignedUrlRequest,
     current_user: models.User = Depends(auth.get_current_user)
 ):
-    bucket_name = os.getenv("AWS_STORAGE_BUCKET_NAME")
+    bucket_name = os.getenv("R2_BUCKET_NAME") or os.getenv("AWS_STORAGE_BUCKET_NAME")
     if not bucket_name:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Direct uploads are disabled because AWS S3 is not configured."
+            detail="Direct uploads are disabled because AWS S3/R2 is not configured."
         )
 
     if payload.folder not in ["profile_pics", "product_images", "general"]:

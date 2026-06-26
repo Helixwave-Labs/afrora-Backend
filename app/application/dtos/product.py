@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from datetime import datetime
 from typing import Optional, List
 from app.application.dtos.user import UserOut
@@ -74,6 +74,14 @@ class ProductOut(ProductBase):
     average_rating: Optional[float] = None
     review_count: int = 0
 
+    @field_validator("image_url")
+    @classmethod
+    def resolve_image_url(cls, v: Optional[str]) -> Optional[str]:
+        if not v:
+            return v
+        from app.infrastructure.services.s3_service import get_full_s3_url
+        return get_full_s3_url(v)
+
     class Config:
         from_attributes = True
 
@@ -83,6 +91,14 @@ class CartProductOut(BaseModel):
     name: str
     price: float
     image_url: Optional[str] = None
+
+    @field_validator("image_url")
+    @classmethod
+    def resolve_image_url(cls, v: Optional[str]) -> Optional[str]:
+        if not v:
+            return v
+        from app.infrastructure.services.s3_service import get_full_s3_url
+        return get_full_s3_url(v)
 
     class Config:
         from_attributes = True
@@ -94,6 +110,14 @@ class ShopOut(BaseModel):
     description: Optional[str] = None
     banner_url: Optional[str] = None
     created_at: datetime
+
+    @field_validator("banner_url")
+    @classmethod
+    def resolve_banner_url(cls, v: Optional[str]) -> Optional[str]:
+        if not v:
+            return v
+        from app.infrastructure.services.s3_service import get_full_s3_url
+        return get_full_s3_url(v)
 
     class Config:
         from_attributes = True

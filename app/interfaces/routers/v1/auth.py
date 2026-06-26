@@ -303,7 +303,7 @@ async def upload_profile_picture(
             detail="Invalid file type. Please upload an image."
         )
 
-    bucket_name = os.getenv("AWS_STORAGE_BUCKET_NAME")
+    bucket_name = os.getenv("R2_BUCKET_NAME") or os.getenv("AWS_STORAGE_BUCKET_NAME")
     if bucket_name:
         if current_user.profile_picture_url:
             delete_file_from_s3(current_user.profile_picture_url)

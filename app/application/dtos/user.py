@@ -1,4 +1,4 @@
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, field_validator
 from datetime import datetime
 from typing import Optional
 
@@ -29,6 +29,14 @@ class UserOut(BaseModel):
     is_active: bool
     role: str
     created_at: datetime
+
+    @field_validator("profile_picture_url")
+    @classmethod
+    def resolve_profile_picture_url(cls, v: Optional[str]) -> Optional[str]:
+        if not v:
+            return v
+        from app.infrastructure.services.s3_service import get_full_s3_url
+        return get_full_s3_url(v)
 
     class Config:
         from_attributes = True

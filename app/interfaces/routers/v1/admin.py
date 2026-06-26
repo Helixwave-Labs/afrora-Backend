@@ -1048,7 +1048,10 @@ async def get_banners(
     db: AsyncSession = Depends(get_read_db)
 ):
     settings = await get_banner_settings(db)
-    return settings
+    from app.infrastructure.services.s3_service import get_full_s3_url
+    dto = schemas.BannerSettingsOut.model_validate(settings)
+    dto.hero_image_src = get_full_s3_url(dto.hero_image_src)
+    return dto
 
 @router.patch("/banners", response_model=schemas.BannerSettingsOut)
 async def update_banners(
@@ -1063,23 +1066,41 @@ async def update_banners(
         
     await db.commit()
     await db.refresh(settings)
-    return settings
+    
+    from app.infrastructure.services.s3_service import get_full_s3_url
+    dto = schemas.BannerSettingsOut.model_validate(settings)
+    dto.hero_image_src = get_full_s3_url(dto.hero_image_src)
+    return dto
 
 # --- 11. Upload ---
 
 @router.post("/upload/presigned-url")
 def get_admin_upload_url(
-    payload: schemas.BroadcastRequest,  # Reuse or similar schema
+    payload: schemas.AdminPresignedUrlRequest,
+    current_admin: models.AdminUser = Depends(auth.get_current_admin),
     db: AsyncSession = Depends(get_read_db)
 ):
-    # This matches the presigned url request in client uploads
-    bucket_name = os.getenv("AWS_STORAGE_BUCKET_NAME")
+    bucket_name = os.getenv("R2_BUCKET_NAME") or os.getenv("AWS_STORAGE_BUCKET_NAME")
     if not bucket_name:
         raise HTTPException(
             status_code=500,
-            detail="AWS S3 is not configured."
+            detail="AWS S3/R2 is not configured."
         )
-    return {"message": "S3 presigned URL support endpoint"}
+
+    if payload.folder not in ["profile_pics", "product_images", "banners", "general"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid folder destination specified."
+        )
+
+    safe_file_name = f"admin_{current_admin.id}_{payload.file_name}"
+    
+    presigned_data = generate_presigned_post_data(
+        file_name=safe_file_name,
+        file_type=payload.file_type,
+        folder=payload.folder
+    )
+    return presigned_data
 
 # --- 12. Notifications ---
 

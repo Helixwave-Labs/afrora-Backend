@@ -1,4 +1,4 @@
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, field_validator
 from datetime import datetime
 from typing import Optional, List
 from enum import Enum
@@ -25,6 +25,14 @@ class AdminOut(BaseModel):
     last_login: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
+
+    @field_validator("avatar")
+    @classmethod
+    def resolve_avatar(cls, v: Optional[str]) -> Optional[str]:
+        if not v:
+            return v
+        from app.infrastructure.services.s3_service import get_full_s3_url
+        return get_full_s3_url(v)
 
     class Config:
         from_attributes = True
@@ -78,6 +86,14 @@ class BannerSettingsOut(BaseModel):
     announcement_active: bool
     announcement_dismissible: bool
     updated_at: datetime
+
+    @field_validator("hero_image_src")
+    @classmethod
+    def resolve_hero_image_src(cls, v: Optional[str]) -> Optional[str]:
+        if not v:
+            return v
+        from app.infrastructure.services.s3_service import get_full_s3_url
+        return get_full_s3_url(v)
 
     class Config:
         from_attributes = True
@@ -171,6 +187,12 @@ class BroadcastRequest(BaseModel):
     title: str
     message: str
     target_role: Optional[str] = "all"  # all, seller, customer
+
+# Upload DTOs
+class AdminPresignedUrlRequest(BaseModel):
+    file_name: str
+    file_type: str
+    folder: str = "general"
 
 # Analytics DTOs
 class AnalyticsOverviewOut(BaseModel):
